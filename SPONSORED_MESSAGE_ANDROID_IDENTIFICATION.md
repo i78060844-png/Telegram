@@ -26,9 +26,11 @@ public static String APP_HASH = "014b35b6184100b085b0d0572f9b5103";
 При создании соединения передаются следующие параметры:
 
 ```java
-// Строки 206-265
+// Строки 221-229 в конструкторе ConnectionsManager
 String deviceModel = Build.MANUFACTURER + Build.MODEL;  // Например: "Samsung Galaxy S21"
 String systemVersion = "SDK " + Build.VERSION.SDK_INT;  // Например: "SDK 33"
+PackageInfo pInfo = ApplicationLoader.applicationContext.getPackageManager()
+    .getPackageInfo(ApplicationLoader.applicationContext.getPackageName(), 0);
 String appVersion = pInfo.versionName + " (" + pInfo.versionCode + ")";  // Например: "10.0.0 (1234)"
 ```
 
@@ -41,21 +43,22 @@ init(SharedConfig.buildVersion(), TLRPC.LAYER, BuildVars.APP_ID, deviceModel,
      getUserConfig().getClientUserId(), userPremium, enablePushConnection);
 ```
 
-### 3. TL Schema - initConnection
+### 3. Native инициализация соединения
 
-**Файл:** `TMessagesProj/src/main/java/org/telegram/tgnet/TLRPC.java`
+**Файл:** `TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java`
 
-Telegram использует TL (Type Language) схему для сериализации данных. Класс `TL_codeSettings` содержит поля идентификации:
+Параметры идентификации передаются через native метод инициализации (строка 643):
 
 ```java
-public class TL_codeSettings extends TLObject {
-    public String device_model;   // Модель устройства
-    public String system_version; // Версия системы (SDK XX для Android)
-    public int api_id;            // ID приложения
-    public String app_version;    // Версия приложения
-    // ...
-}
+native_init(currentAccount, version, layer, apiId, deviceModel, systemVersion, 
+            appVersion, langCode, systemLangCode, configPath, logPath, regId, 
+            cFingerprint, installer, packageId, timezoneOffset, userId, userPremium, 
+            enablePushConnection, ApplicationLoader.isNetworkOnline(), 
+            ApplicationLoader.getCurrentNetworkType(), 
+            SharedConfig.measureDevicePerformanceClass());
 ```
+
+Параметры `apiId`, `deviceModel`, `systemVersion`, `appVersion` используются для формирования `initConnection` запроса к серверу Telegram, который определяет платформу клиента.
 
 ## Процесс получения SponsoredMessage
 
@@ -75,19 +78,39 @@ public static class TL_messages_getSponsoredMessages extends TLObject {
 
 ### Вызов в коде
 
-**Файл:** `TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java` (строки 20168-20182)
+**Файл:** `TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java` (строки 20168-20254)
 
 ```java
 public SponsoredMessagesInfo getSponsoredMessages(long dialogId) {
-    // ...
+    // Проверка кэша: если данные загружены менее 5 минут назад, возвращаем кэш
+    SponsoredMessagesInfo info = sponsoredMessages.get(dialogId);
+    if (info != null && (info.loading || 
+        Math.abs(SystemClock.elapsedRealtime() - info.loadTime) <= 5 * 60 * 1000)) {
+        return info;
+    }
+    
+    // Проверка: SponsoredMessages доступны только для каналов и ботов
+    if (dialogId < 0 ? !ChatObject.isChannel(getChat(-dialogId)) 
+                     : !UserObject.isBot(getUser(dialogId))) {
+        return null;
+    }
+    
+    // Создание запроса и отправка
+    info = new SponsoredMessagesInfo();
+    info.loading = true;
+    sponsoredMessages.put(dialogId, info);
+    
     TLRPC.TL_messages_getSponsoredMessages req = new TLRPC.TL_messages_getSponsoredMessages();
     req.peer = getInputPeer(dialogId);
     getConnectionsManager().sendRequest(req, (response, error) -> {
-        // Обработка ответа
+        // Обработка ответа: парсинг пользователей, чатов и сообщений
+        // ...
     });
-    // ...
+    return info;
 }
 ```
+
+**Примечание:** Метод включает кэширование (5 минут), проверку типа диалога (только каналы и боты могут иметь спонсируемые сообщения), и асинхронную обработку ответа.
 
 ## Как сервер понимает, что это Android
 
